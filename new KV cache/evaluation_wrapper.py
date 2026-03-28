@@ -9,8 +9,9 @@ Note:
 - The generate() method is optional and mainly for debugging.
 """
 import inspect
+import math
 import types
-from typing import Dict
+from typing import Dict, Optional
 try:
     from PIL import Image
 except ImportError:
@@ -21,291 +22,309 @@ import torch
 from transformers import AutoModelForImageTextToText, AutoProcessor
 
 
-def _repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """
-    Repeat KV heads to match attention head count.
-    """
-    batch, num_key_value_heads, seq_len, head_dim = hidden_states.shape
-    if n_rep == 1:
+def _expand_kv_heads(hidden_states: torch.Tensor, groups: int) -> torch.Tensor:
+    batch, kv_heads, seq_len, head_dim = hidden_states.shape
+    if groups == 1:
         return hidden_states
-    hidden_states = hidden_states[:, :, None, :, :].expand(
-        batch, num_key_value_heads, n_rep, seq_len, head_dim
-    )
-    return hidden_states.reshape(batch, num_key_value_heads * n_rep, seq_len, head_dim)
+    expanded = hidden_states[:, :, None, :, :].expand(batch, kv_heads, groups, seq_len, head_dim)
+    return expanded.reshape(batch, kv_heads * groups, seq_len, head_dim)
 
 
-def _pack_2bit(values: torch.Tensor) -> tuple[torch.Tensor, int]:
-    """
-    Pack uint8 values in [0, 3] into uint8 bytes, 4 values per byte.
-    """
-    original_last_dim = values.shape[-1]
-    pad = (-original_last_dim) % 4
-    if pad > 0:
+def _build_random_orthogonal_matrix(
+    dim: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    seed: int,
+) -> torch.Tensor:
+    generator = torch.Generator(device=device)
+    generator.manual_seed(seed)
+    gaussian = torch.randn(dim, dim, generator=generator, device=device, dtype=torch.float32)
+    q_matrix, _ = torch.linalg.qr(gaussian, mode="reduced")
+    return q_matrix.to(dtype=dtype)
+
+
+def _build_scalar_codebook(levels: int, device: torch.device) -> torch.Tensor:
+    if levels <= 1:
+        return torch.zeros(1, device=device, dtype=torch.float32)
+    probs = (torch.arange(levels, device=device, dtype=torch.float32) + 0.5) / levels
+    probs = probs.clamp(1e-6, 1.0 - 1e-6)
+    return (math.sqrt(2.0) * torch.erfinv(2.0 * probs - 1.0)).to(torch.float32)
+
+
+def _pack_lowbit(values: torch.Tensor, bits: int) -> tuple[torch.Tensor, int]:
+    values = values.to(torch.uint8)
+    values_per_byte = 8 // bits
+    original_size = values.shape[-1]
+    pad = (-original_size) % values_per_byte
+    if pad:
         values = torch.nn.functional.pad(values, (0, pad))
 
-    packed = (
-        values[..., 0::4]
-        | (values[..., 1::4] << 2)
-        | (values[..., 2::4] << 4)
-        | (values[..., 3::4] << 6)
-    )
-    return packed.contiguous(), original_last_dim
+    packed = torch.zeros(*values.shape[:-1], values.shape[-1] // values_per_byte, dtype=torch.uint8, device=values.device)
+    bit_mask = (1 << bits) - 1
+    for i in range(values_per_byte):
+        packed |= ((values[..., i::values_per_byte] & bit_mask) << (i * bits))
+    return packed.contiguous(), original_size
 
 
-def _unpack_2bit(packed: torch.Tensor, original_last_dim: int) -> torch.Tensor:
-    unpacked = torch.stack(
-        [
-            packed & 0x03,
-            (packed >> 2) & 0x03,
-            (packed >> 4) & 0x03,
-            (packed >> 6) & 0x03,
-        ],
-        dim=-1,
-    ).reshape(*packed.shape[:-1], -1)
-    return unpacked[..., :original_last_dim].contiguous()
+def _unpack_lowbit(packed: torch.Tensor, bits: int, original_size: int) -> torch.Tensor:
+    values_per_byte = 8 // bits
+    bit_mask = (1 << bits) - 1
+    unpacked = []
+    for i in range(values_per_byte):
+        unpacked.append((packed >> (i * bits)) & bit_mask)
+    return torch.stack(unpacked, dim=-1).reshape(*packed.shape[:-1], -1)[..., :original_size].contiguous()
 
 
-def _quantize_kivi_key_chunk(key_chunk: torch.Tensor, group_size: int) -> dict:
-    """
-    KIVI-style key quantization: per-channel over sequence groups.
-    Input shape: [B, KVH, S, D]
-    """
-    batch, kv_heads, seq_len, head_dim = key_chunk.shape
-    transposed = key_chunk.permute(0, 1, 3, 2).contiguous()
-    seq_pad = (-seq_len) % group_size
-    if seq_pad > 0:
-        transposed = torch.nn.functional.pad(transposed, (0, seq_pad))
-    grouped = transposed.view(batch, kv_heads, head_dim, -1, group_size)
-
-    min_vals = grouped.amin(dim=-1, keepdim=True)
-    max_vals = grouped.amax(dim=-1, keepdim=True)
-    scales = (max_vals - min_vals).clamp_min(1e-5) / 3.0
-    quantized = ((grouped - min_vals) / scales).round().clamp(0, 3).to(torch.uint8)
-    packed, packed_last_dim = _pack_2bit(quantized)
-    return {
-        "packed": packed,
-        "min": min_vals.to(torch.float16).contiguous(),
-        "scale": scales.to(torch.float16).contiguous(),
-        "seq_len": seq_len,
-        "group_size": group_size,
-        "packed_last_dim": packed_last_dim,
-    }
+def _pack_sign_bits(signs: torch.Tensor) -> tuple[torch.Tensor, int]:
+    bits = (signs > 0).to(torch.uint8)
+    return _pack_lowbit(bits, bits=1)
 
 
-def _dequantize_kivi_key_chunk(quantized: dict, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    packed = quantized["packed"].to(device=device, non_blocking=True)
-    min_vals = quantized["min"].to(device=device, dtype=dtype, non_blocking=True)
-    scales = quantized["scale"].to(device=device, dtype=dtype, non_blocking=True)
-    unpacked = _unpack_2bit(packed, quantized["packed_last_dim"]).to(dtype)
-    unpacked = unpacked.view(*min_vals.shape[:-1], quantized["group_size"])
-    restored = unpacked * scales + min_vals
-    restored = restored.view(*restored.shape[:-2], -1)[..., : quantized["seq_len"]]
-    return restored.permute(0, 1, 3, 2).contiguous()
+def _unpack_sign_bits(packed: torch.Tensor, original_size: int) -> torch.Tensor:
+    unpacked = _unpack_lowbit(packed, bits=1, original_size=original_size)
+    return torch.where(unpacked > 0, 1.0, -1.0)
 
 
-def _quantize_kivi_value_chunk(value_chunk: torch.Tensor, group_size: int) -> dict:
-    """
-    KIVI-style value quantization: per-token over head-dim groups.
-    Input shape: [B, KVH, S, D]
-    """
-    batch, kv_heads, seq_len, head_dim = value_chunk.shape
-    dim_pad = (-head_dim) % group_size
-    if dim_pad > 0:
-        value_chunk = torch.nn.functional.pad(value_chunk, (0, dim_pad))
-    grouped = value_chunk.view(batch, kv_heads, seq_len, -1, group_size)
+class _TurboQuantMSE:
+    def __init__(self, dim: int, bits: int, device: torch.device, seed: int):
+        self.dim = dim
+        self.bits = bits
+        self.levels = 1 << bits
+        self.rotation = _build_random_orthogonal_matrix(dim, device, torch.float32, seed)
+        self.codebook = _build_scalar_codebook(self.levels, device)
 
-    min_vals = grouped.amin(dim=-1, keepdim=True)
-    max_vals = grouped.amax(dim=-1, keepdim=True)
-    scales = (max_vals - min_vals).clamp_min(1e-5) / 3.0
-    quantized = ((grouped - min_vals) / scales).round().clamp(0, 3).to(torch.uint8)
-    packed, packed_last_dim = _pack_2bit(quantized)
-    return {
-        "packed": packed,
-        "min": min_vals.to(torch.float16).contiguous(),
-        "scale": scales.to(torch.float16).contiguous(),
-        "head_dim": head_dim,
-        "group_size": group_size,
-        "packed_last_dim": packed_last_dim,
-    }
+    def quantize(self, values: torch.Tensor) -> dict:
+        norms = values.float().norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        normalized_values = values.float() / norms
+        rotated = torch.matmul(normalized_values, self.rotation.transpose(0, 1))
+        distance = (rotated.unsqueeze(-1) - self.codebook).abs()
+        indices = distance.argmin(dim=-1).to(torch.uint8)
+        packed_indices, original_dim = _pack_lowbit(indices, bits=self.bits)
+        return {
+            "packed_indices": packed_indices,
+            "original_dim": original_dim,
+            "norms": norms.to(torch.float16).contiguous(),
+        }
 
-
-def _dequantize_kivi_value_chunk(quantized: dict, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    packed = quantized["packed"].to(device=device, non_blocking=True)
-    min_vals = quantized["min"].to(device=device, dtype=dtype, non_blocking=True)
-    scales = quantized["scale"].to(device=device, dtype=dtype, non_blocking=True)
-    unpacked = _unpack_2bit(packed, quantized["packed_last_dim"]).to(dtype)
-    unpacked = unpacked.view(*min_vals.shape[:-1], quantized["group_size"])
-    restored = unpacked * scales + min_vals
-    restored = restored.view(*restored.shape[:-2], -1)[..., : quantized["head_dim"]]
-    return restored.contiguous()
+    def dequantize(self, quantized: dict, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        packed_indices = quantized["packed_indices"].to(device=device, non_blocking=True)
+        indices = _unpack_lowbit(
+            packed_indices,
+            bits=self.bits,
+            original_size=quantized["original_dim"],
+        ).long()
+        norms = quantized["norms"].to(device=device, dtype=torch.float32, non_blocking=True)
+        rotated = self.codebook.to(device=device)[indices]
+        restored = torch.matmul(rotated, self.rotation.to(device=device)) * norms
+        return restored.to(dtype=dtype)
 
 
-def _append_to_paged_kv_cache(module, key_states: torch.Tensor, value_states: torch.Tensor):
-    """
-    Keep per-layer KV cache in paged form using:
-    - KIVI-style 2-bit quantized pages
-    - packed uint8 storage
-    - a page table for external fragmentation management
-    """
-    if getattr(module, "_kv_quant_blocks", None) is None:
-        module._kv_quant_blocks = []
-        module._kv_page_table = []
-        module._kv_page_buffer_key = None
-        module._kv_page_buffer_value = None
-        module._kv_next_logical_page = 0
+class _TurboQuantProd:
+    def __init__(self, dim: int, bits: int, device: torch.device, seed: int, qjl_dim: Optional[int] = None):
+        self.dim = dim
+        self.bits = bits
+        self.mse_quantizer = _TurboQuantMSE(dim, max(1, bits - 1), device, seed)
+        self.qjl_dim = qjl_dim or dim
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(seed + 1)
+        self.projection = torch.randn(self.qjl_dim, dim, generator=generator, dtype=torch.float32, device=device)
+        self.residual_scale = math.sqrt(math.pi / 2.0) / self.qjl_dim
 
-    buffer_key = getattr(module, "_kv_page_buffer_key", None)
-    buffer_value = getattr(module, "_kv_page_buffer_value", None)
-    if buffer_key is None:
-        buffer_key = key_states.detach().contiguous()
-        buffer_value = value_states.detach().contiguous()
-    else:
-        buffer_key = torch.cat([buffer_key, key_states.detach()], dim=-2).contiguous()
-        buffer_value = torch.cat([buffer_value, value_states.detach()], dim=-2).contiguous()
+    def quantize(self, values: torch.Tensor) -> dict:
+        mse_quantized = self.mse_quantizer.quantize(values)
+        base = self.mse_quantizer.dequantize(mse_quantized, values.device, torch.float32)
+        residual = values.float() - base
+        projected = torch.matmul(residual, self.projection.transpose(0, 1))
+        qjl = torch.where(projected >= 0, 1.0, -1.0)
+        packed_qjl, qjl_dim = _pack_sign_bits(qjl)
+        gamma = residual.norm(dim=-1, keepdim=True).to(torch.float16)
+        return {
+            "mse": mse_quantized,
+            "packed_qjl": packed_qjl,
+            "qjl_dim": qjl_dim,
+            "gamma": gamma.contiguous(),
+        }
 
-    group_size = max(1, getattr(module, "_gpu_kv_quant_group_size", 32))
-    page_size = max(1, getattr(module, "_gpu_kv_page_size", 64))
+    def dequantize(self, quantized: dict, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        base = self.mse_quantizer.dequantize(quantized["mse"], device, torch.float32)
+        packed_qjl = quantized["packed_qjl"].to(device=device, non_blocking=True)
+        qjl = _unpack_sign_bits(packed_qjl, quantized["qjl_dim"]).to(device=device, dtype=torch.float32)
+        gamma = quantized["gamma"].to(device=device, dtype=torch.float32, non_blocking=True)
+        residual = torch.matmul(qjl, self.projection.to(device=device))
+        residual = residual * gamma * self.residual_scale
+        return (base + residual).to(dtype=dtype)
 
-    while buffer_key.shape[-2] >= page_size:
-        page_key = buffer_key[:, :, :page_size, :].contiguous()
-        page_value = buffer_value[:, :, :page_size, :].contiguous()
+    def inner_product(self, query: torch.Tensor, quantized: dict) -> torch.Tensor:
+        base = self.mse_quantizer.dequantize(quantized["mse"], query.device, torch.float32)
+        term1 = (query.float() * base).sum(dim=-1)
+        packed_qjl = quantized["packed_qjl"].to(device=query.device, non_blocking=True)
+        qjl = _unpack_sign_bits(packed_qjl, quantized["qjl_dim"]).to(device=query.device, dtype=torch.float32)
+        gamma = quantized["gamma"].to(device=query.device, dtype=torch.float32, non_blocking=True).squeeze(-1)
+        projected_query = torch.matmul(query.float(), self.projection.to(device=query.device).transpose(0, 1))
+        term2 = gamma * self.residual_scale * (projected_query * qjl).sum(dim=-1)
+        return term1 + term2
 
-        quant_key = _quantize_kivi_key_chunk(page_key, group_size)
-        quant_value = _quantize_kivi_value_chunk(page_value, group_size)
 
-        block_id = len(module._kv_quant_blocks)
-        module._kv_quant_blocks.append(
-            {
-                "key": quant_key,
-                "value": quant_value,
-                "valid_tokens": page_size,
-            }
+class _TurboQuantCodec:
+    def __init__(self, key_bits: int, value_bits: int, layer_seed: int):
+        self.key_bits = key_bits
+        self.value_bits = value_bits
+        self.layer_seed = layer_seed
+        self._key_quantizers: Dict[tuple[int, str], _TurboQuantProd] = {}
+        self._value_quantizers: Dict[tuple[int, str], _TurboQuantMSE] = {}
+
+    def _get_key_quantizer(self, dim: int, device: torch.device) -> _TurboQuantProd:
+        key = (dim, str(device))
+        quantizer = self._key_quantizers.get(key)
+        if quantizer is None:
+            quantizer = _TurboQuantProd(dim, self.key_bits, device, self.layer_seed + dim * 17)
+            self._key_quantizers[key] = quantizer
+        return quantizer
+
+    def _get_value_quantizer(self, dim: int, device: torch.device) -> _TurboQuantMSE:
+        key = (dim, str(device))
+        quantizer = self._value_quantizers.get(key)
+        if quantizer is None:
+            quantizer = _TurboQuantMSE(dim, self.value_bits, device, self.layer_seed + 100 + dim * 19)
+            self._value_quantizers[key] = quantizer
+        return quantizer
+
+    def quantize_key_cache(self, values: torch.Tensor) -> dict:
+        quantizer = self._get_key_quantizer(values.shape[-1], values.device)
+        flat = values.detach().contiguous().view(-1, values.shape[-1])
+        quantized = quantizer.quantize(flat)
+        return {
+            "shape": tuple(values.shape),
+            "payload": quantized,
+        }
+
+    def quantize_value_cache(self, values: torch.Tensor) -> dict:
+        quantizer = self._get_value_quantizer(values.shape[-1], values.device)
+        flat = values.detach().contiguous().view(-1, values.shape[-1])
+        quantized = quantizer.quantize(flat)
+        return {
+            "shape": tuple(values.shape),
+            "payload": quantized,
+        }
+
+    def dequantize_value_cache(self, cache: dict, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        dim = cache["shape"][-1]
+        quantizer = self._get_value_quantizer(dim, device)
+        restored = quantizer.dequantize(cache["payload"], device, dtype)
+        return restored.view(*cache["shape"]).contiguous()
+
+    def key_inner_product(self, query: torch.Tensor, cache: dict) -> torch.Tensor:
+        dim = cache["shape"][-1]
+        quantizer = self._get_key_quantizer(dim, query.device)
+        flat_query = query.contiguous().view(-1, dim)
+        scores = quantizer.inner_product(flat_query, cache["payload"])
+        return scores
+
+
+class _LayerKVRuntime:
+    def __init__(self, key_bits: int, value_bits: int, layer_seed: int):
+        self.codec = _TurboQuantCodec(key_bits=key_bits, value_bits=value_bits, layer_seed=layer_seed)
+        self.quantized_key_cache: Optional[dict] = None
+        self.quantized_value_cache: Optional[dict] = None
+        self.dense_key_tail: Optional[torch.Tensor] = None
+        self.dense_value_tail: Optional[torch.Tensor] = None
+        self.decode_tokens = 0
+        self.prefill_ready = False
+
+    def reset(self):
+        self.quantized_key_cache = None
+        self.quantized_value_cache = None
+        self.dense_key_tail = None
+        self.dense_value_tail = None
+        self.decode_tokens = 0
+        self.prefill_ready = False
+
+    def ingest_prefill(self, key_states: torch.Tensor, value_states: torch.Tensor):
+        self.reset()
+        self.quantized_key_cache = self.codec.quantize_key_cache(key_states)
+        self.quantized_value_cache = self.codec.quantize_value_cache(value_states)
+        self.prefill_ready = True
+
+    def append_decode(self, key_states: torch.Tensor, value_states: torch.Tensor):
+        detached_keys = key_states.detach().contiguous()
+        detached_values = value_states.detach().contiguous()
+
+        if self.dense_key_tail is None:
+            self.dense_key_tail = detached_keys
+            self.dense_value_tail = detached_values
+        else:
+            self.dense_key_tail = torch.cat([self.dense_key_tail, detached_keys], dim=-2).contiguous()
+            self.dense_value_tail = torch.cat([self.dense_value_tail, detached_values], dim=-2).contiguous()
+
+        self.decode_tokens += key_states.shape[-2]
+        self.prefill_ready = True
+
+    def materialize_values(self, device: torch.device, dtype: torch.dtype) -> Optional[torch.Tensor]:
+        value_chunks = []
+
+        if self.quantized_value_cache is not None:
+            value_chunks.append(
+                self.codec.dequantize_value_cache(self.quantized_value_cache, device, dtype)
+            )
+
+        if self.dense_value_tail is not None:
+            value_chunks.append(self.dense_value_tail.to(device=device, dtype=dtype, non_blocking=True))
+
+        if not value_chunks:
+            return None
+        return torch.cat(value_chunks, dim=-2)
+
+    def attention_scores(self, query_states: torch.Tensor) -> Optional[torch.Tensor]:
+        batch, heads, query_len, head_dim = query_states.shape
+        flat_query = query_states.contiguous().view(-1, head_dim)
+        score_chunks = []
+
+        if self.quantized_key_cache is not None:
+            quantized_scores = self.codec.key_inner_product(flat_query, self.quantized_key_cache)
+            quantized_scores = quantized_scores.view(batch, heads, query_len, -1)
+            score_chunks.append(quantized_scores)
+
+        if self.dense_key_tail is not None:
+            expanded_key = _expand_kv_heads(self.dense_key_tail, heads // self.dense_key_tail.shape[1])
+            dense_scores = torch.matmul(query_states, expanded_key.transpose(2, 3))
+            score_chunks.append(dense_scores)
+
+        if not score_chunks:
+            return None
+        return torch.cat(score_chunks, dim=-1)
+
+
+def _get_layer_kv_runtime(module) -> _LayerKVRuntime:
+    runtime = getattr(module, "_turbo_kv_runtime", None)
+    if runtime is None:
+        runtime = _LayerKVRuntime(
+            key_bits=max(2, getattr(module, "_turbo_kv_key_bits", 3)),
+            value_bits=max(1, getattr(module, "_turbo_kv_value_bits", 3)),
+            layer_seed=1009 + int(getattr(module, "layer_idx", 0)),
         )
-        module._kv_page_table.append(
-            {
-                "logical_page_id": module._kv_next_logical_page,
-                "block_id": block_id,
-            }
-        )
-        module._kv_next_logical_page += 1
-        buffer_key = buffer_key[:, :, page_size:, :].contiguous()
-        buffer_value = buffer_value[:, :, page_size:, :].contiguous()
-
-    module._kv_page_buffer_key = buffer_key
-    module._kv_page_buffer_value = buffer_value
+        module._turbo_kv_runtime = runtime
+    return runtime
 
 
-def _gather_paged_kv_cache(module):
-    quant_blocks = getattr(module, "_kv_quant_blocks", None) or []
-    page_table = getattr(module, "_kv_page_table", None) or []
-    page_buffer_key = getattr(module, "_kv_page_buffer_key", None)
-    page_buffer_value = getattr(module, "_kv_page_buffer_value", None)
-
-    key_tensors = []
-    value_tensors = []
-
-    if page_buffer_key is not None:
-        device = page_buffer_key.device
-        dtype = page_buffer_key.dtype
-    elif quant_blocks:
-        device = quant_blocks[0]["key"]["packed"].device
-        dtype = torch.float16
-    else:
-        return None, None
-
-    for page_entry in page_table:
-        block = quant_blocks[page_entry["block_id"]]
-        block_key = _dequantize_kivi_key_chunk(block["key"], device=device, dtype=dtype)
-        block_value = _dequantize_kivi_value_chunk(block["value"], device=device, dtype=dtype)
-        valid_tokens = block["valid_tokens"]
-        if valid_tokens > 0:
-            key_tensors.append(block_key[:, :, :valid_tokens, :])
-            value_tensors.append(block_value[:, :, :valid_tokens, :])
-
-    if page_buffer_key is not None and page_buffer_value is not None:
-        key_tensors.append(page_buffer_key)
-        value_tensors.append(page_buffer_value)
-
-    if not key_tensors or not value_tensors:
-        return None, None
-
-    return torch.cat(key_tensors, dim=-2), torch.cat(value_tensors, dim=-2)
-
-
-def _populate_custom_cache_from_original(
+def _turboquant_attention(
     module,
-    key_states: torch.Tensor,
-    value_states: torch.Tensor,
-):
-    module._kv_quant_blocks = []
-    module._kv_page_table = []
-    module._kv_page_buffer_key = None
-    module._kv_page_buffer_value = None
-    module._kv_next_logical_page = 0
-    _append_to_paged_kv_cache(module, key_states, value_states)
-
-
-def _paged_kv_attention(
-    module,
+    runtime: _LayerKVRuntime,
     query_states: torch.Tensor,
-    key_cache: torch.Tensor,
-    value_cache: torch.Tensor,
-    attention_mask: torch.Tensor = None,
+    attention_mask: Optional[torch.Tensor] = None,
 ):
-    """
-    Compute attention from paged KV cache stored on GPU.
-    """
-    key_states = _repeat_kv(key_cache, module.num_key_value_groups)
-    value_states = _repeat_kv(value_cache, module.num_key_value_groups)
-    attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * module.scaling
+    scores = runtime.attention_scores(query_states)
+    if scores is None:
+        return None, None
+    values = runtime.materialize_values(query_states.device, query_states.dtype)
+    if values is None:
+        return None, None
+    expanded_value = _expand_kv_heads(values, module.num_key_value_groups)
+    scores = scores * module.scaling
     if attention_mask is not None:
-        attn_weights = attn_weights + attention_mask
-    attn_weights = torch.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-    attn_output = torch.matmul(attn_weights, value_states).transpose(1, 2).contiguous()
-    return attn_output, attn_weights
-
-
-def _quoka_prefill_attention(
-    module,
-    query_states: torch.Tensor,
-    key_cache: torch.Tensor,
-    value_cache: torch.Tensor,
-    attention_mask: torch.Tensor = None,
-):
-    """
-    QUOKA-style prefill attention:
-    - score KV cache by cosine similarity
-    - keep only top-k KV positions for each query position
-    """
-    key_states = _repeat_kv(key_cache, module.num_key_value_groups)
-    value_states = _repeat_kv(value_cache, module.num_key_value_groups)
-
-    normalized_query = torch.nn.functional.normalize(query_states, dim=-1)
-    normalized_key = torch.nn.functional.normalize(key_states, dim=-1)
-    cosine_scores = torch.matmul(normalized_query, normalized_key.transpose(2, 3))
-
-    total_kv_tokens = cosine_scores.shape[-1]
-    top_k = max(1, min(getattr(module, "_prefill_quoka_top_k", 128), total_kv_tokens))
-    topk_indices = torch.topk(cosine_scores, k=top_k, dim=-1).indices
-
-    expanded_key_states = key_states.unsqueeze(2).expand(-1, -1, query_states.shape[-2], -1, -1)
-    expanded_value_states = value_states.unsqueeze(2).expand(-1, -1, query_states.shape[-2], -1, -1)
-    gather_index = topk_indices.unsqueeze(-1).expand(-1, -1, -1, -1, key_states.shape[-1])
-    selected_key_states = expanded_key_states.gather(3, gather_index)
-    selected_value_states = expanded_value_states.gather(3, gather_index)
-    selected_scores = torch.gather(cosine_scores, dim=-1, index=topk_indices)
-
-    attn_weights = selected_scores * module.scaling
-    if attention_mask is not None:
-        if attention_mask.shape[1] == 1 and topk_indices.shape[1] != 1:
-            attention_mask = attention_mask.expand(-1, topk_indices.shape[1], -1, -1)
-        selected_mask = torch.gather(attention_mask, dim=-1, index=topk_indices)
-        attn_weights = attn_weights + selected_mask
-
-    attn_weights = torch.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-    attn_output = torch.sum(attn_weights.unsqueeze(-1) * selected_value_states, dim=-2)
-    attn_output = attn_output.transpose(1, 2).contiguous()
-    return attn_output, attn_weights
+        scores = scores + attention_mask
+    probs = torch.softmax(scores, dim=-1, dtype=torch.float32).to(query_states.dtype)
+    output = torch.matmul(probs, expanded_value).transpose(1, 2).contiguous()
+    return output, probs
 
 
 def _build_swiftkv_decoder_layer_forward(original_forward):
@@ -331,12 +350,9 @@ def _build_swiftkv_decoder_layer_forward(original_forward):
     return patched_forward
 
 
-def _build_paged_kv_forward(original_forward):
+def _build_turboquant_kv_forward(original_forward):
     """
-    Build a conservative attention forward that applies paged KV cache.
-
-    If the runtime module shape or helper functions differ from expectation,
-    we fall back to the original implementation.
+    Replace the layer KV path with a TurboQuant cache.
     """
 
     multimodal_rope_fn = original_forward.__globals__.get("apply_multimodal_rotary_pos_emb")
@@ -422,71 +438,41 @@ def _build_paged_kv_forward(original_forward):
                 else:
                     query_states, key_states = rope_fn(query_states, key_states, cos, sin)
 
+            runtime = _get_layer_kv_runtime(self)
             decode_seq_len = query_states.shape[-2]
-            start_after_tokens = max(0, getattr(self, "_kv_start_after_tokens", 0))
+
+            cache_kwargs = {}
+            if cos is not None and sin is not None:
+                cache_kwargs["cos"] = cos
+                cache_kwargs["sin"] = sin
+            if "cache_position" in kwargs:
+                cache_kwargs["cache_position"] = kwargs["cache_position"]
 
             if decode_seq_len > 1:
-                self._kv_quant_blocks = []
-                self._kv_page_table = []
-                self._kv_page_buffer_key = None
-                self._kv_page_buffer_value = None
-                self._kv_next_logical_page = 0
-                self._kv_decode_step = 0
-                _append_to_paged_kv_cache(self, key_states, value_states)
-
-                key_cache, value_cache = _gather_paged_kv_cache(self)
-                if key_cache is None or value_cache is None:
-                    return _call_original(
-                        hidden_states, position_embeddings, attention_mask, past_key_values, kwargs
+                if past_key_values is not None:
+                    key_states, value_states = past_key_values.update(
+                        key_states, value_states, self.layer_idx, cache_kwargs
                     )
-
-                attn_output, attn_weights = _quoka_prefill_attention(
-                    self,
-                    query_states,
-                    key_cache,
-                    value_cache,
-                    attention_mask=attention_mask,
-                )
-
-                attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-                attn_output = self.o_proj(attn_output)
-                return attn_output, attn_weights
-
-            if past_key_values is not None and self._kv_decode_step < start_after_tokens:
-                self._kv_decode_step += decode_seq_len
-                return _call_original(
-                    hidden_states, position_embeddings, attention_mask, past_key_values, kwargs
-                )
-
-            if past_key_values is not None and self._kv_decode_step == start_after_tokens:
-                cache_kwargs = {}
-                if cos is not None and sin is not None:
-                    cache_kwargs["cos"] = cos
-                    cache_kwargs["sin"] = sin
-                if "cache_position" in kwargs:
-                    cache_kwargs["cache_position"] = kwargs["cache_position"]
-                key_states, value_states = past_key_values.update(
-                    key_states, value_states, self.layer_idx, cache_kwargs
-                )
-                _populate_custom_cache_from_original(self, key_states, value_states)
-                self._kv_decode_step += decode_seq_len
+                runtime.ingest_prefill(key_states, value_states)
             else:
-                _append_to_paged_kv_cache(self, key_states, value_states)
-                self._kv_decode_step += decode_seq_len
+                if past_key_values is not None and not runtime.prefill_ready:
+                    key_states, value_states = past_key_values.update(
+                        key_states, value_states, self.layer_idx, cache_kwargs
+                    )
+                    runtime.ingest_prefill(key_states, value_states)
+                else:
+                    runtime.append_decode(key_states, value_states)
 
-            key_cache, value_cache = _gather_paged_kv_cache(self)
-            if key_cache is None or value_cache is None:
-                return _call_original(
-                    hidden_states, position_embeddings, attention_mask, past_key_values, kwargs
-                )
-
-            attn_output, attn_weights = _paged_kv_attention(
+            attn_output, attn_weights = _turboquant_attention(
                 self,
+                runtime,
                 query_states,
-                key_cache,
-                value_cache,
                 attention_mask=attention_mask,
             )
+            if attn_output is None or attn_weights is None:
+                return _call_original(
+                    hidden_states, position_embeddings, attention_mask, past_key_values, kwargs
+                )
 
             attn_output = attn_output.reshape(*input_shape, -1).contiguous()
             attn_output = self.o_proj(attn_output)
@@ -499,7 +485,7 @@ def _build_paged_kv_forward(original_forward):
     return patched_forward
 
 
-def _reset_paged_kv_cache(model):
+def _reset_turboquant_kv_cache(model):
     text_model = getattr(model, "model", None)
     layers = getattr(text_model, "layers", None)
     if layers is None:
@@ -509,27 +495,18 @@ def _reset_paged_kv_cache(model):
         self_attn = getattr(layer, "self_attn", None)
         if self_attn is None:
             continue
-        if hasattr(self_attn, "_kv_quant_blocks"):
-            self_attn._kv_quant_blocks = []
-        if hasattr(self_attn, "_kv_page_table"):
-            self_attn._kv_page_table = []
-        if hasattr(self_attn, "_kv_page_buffer_key"):
-            self_attn._kv_page_buffer_key = None
-        if hasattr(self_attn, "_kv_page_buffer_value"):
-            self_attn._kv_page_buffer_value = None
-        if hasattr(self_attn, "_kv_next_logical_page"):
-            self_attn._kv_next_logical_page = 0
-        if hasattr(self_attn, "_kv_decode_step"):
-            self_attn._kv_decode_step = 0
+        runtime = getattr(self_attn, "_turbo_kv_runtime", None)
+        if runtime is not None:
+            runtime.reset()
 
 
 def _build_resetting_generate(original_generate):
     """
-    Clear paged KV cache before every generation call.
+    Clear TurboQuant KV cache before every generation call.
     """
 
     def patched_generate(self, *args, **kwargs):
-        _reset_paged_kv_cache(self)
+        _reset_turboquant_kv_cache(self)
         return original_generate(*args, **kwargs)
 
     return patched_generate
@@ -691,26 +668,8 @@ class VLMModel:
     
     def _optimize_kv_cache(self):
         """
-        Optimize KV Cache management to reduce memory fragmentation.
-        
-        Optimization Directions:
-        1. Memory layout optimization (contiguous memory allocation)
-        2. Fragmentation-free allocation strategies
-        3. Efficient cache reuse patterns
-        4. Dynamic cache sizing
-        
-        Implementation Steps:
-        1. Understand current KV cache implementation in model layers
-        2. Design memory-efficient cache allocation strategy
-        3. Implement custom KV cache allocator if needed
-        4. Apply optimizations via monkey patch or config modification
-        
-        Target Components:
-        - self._model.config (cache configuration)
-        - Attention layers (KV cache allocation)
-        - Generation loop (cache management)
+        Replace the default KV path with a TurboQuant cache.
         """
-        # Enable KV Cache first
         self._model.config.use_cache = True
         if hasattr(self._model.config, 'pad_token_id'):
             if self._model.config.pad_token_id is None:
@@ -718,8 +677,8 @@ class VLMModel:
         if hasattr(self._model, "generation_config"):
             self._model.generation_config.use_cache = True
 
-        if not hasattr(self._model, "_original_generate_for_paged_kv"):
-            self._model._original_generate_for_paged_kv = self._model.generate
+        if not hasattr(self._model, "_original_generate_for_turbo_kv"):
+            self._model._original_generate_for_turbo_kv = self._model.generate
             self._model.generate = types.MethodType(
                 _build_resetting_generate(self._model.generate),
                 self._model,
@@ -749,35 +708,33 @@ class VLMModel:
                 if not all(hasattr(self_attn, attr) for attr in required_attrs):
                     continue
 
-                self_attn._kv_quant_blocks = []
-                self_attn._kv_page_table = []
-                self_attn._kv_page_buffer_key = None
-                self_attn._kv_page_buffer_value = None
-                self_attn._kv_next_logical_page = 0
-                self_attn._kv_decode_step = 0
-                self_attn._kv_start_after_tokens = 4
-                self_attn._gpu_kv_page_size = 64
-                self_attn._gpu_kv_quant_group_size = 32
-                self_attn._prefill_quoka_top_k = 128
+                self_attn._turbo_kv_key_bits = 3
+                self_attn._turbo_kv_value_bits = 3
+                self_attn._turbo_kv_runtime = _LayerKVRuntime(
+                    key_bits=self_attn._turbo_kv_key_bits,
+                    value_bits=self_attn._turbo_kv_value_bits,
+                    layer_seed=1009 + layer_idx,
+                )
 
-                if hasattr(self_attn, "_original_forward_for_paged_kv"):
+                if hasattr(self_attn, "_original_forward_for_turbo_kv"):
                     continue
 
-                self_attn._original_forward_for_paged_kv = self_attn.forward
+                self_attn._original_forward_for_turbo_kv = self_attn.forward
                 self_attn.forward = types.MethodType(
-                    _build_paged_kv_forward(self_attn.forward),
+                    _build_turboquant_kv_forward(self_attn.forward),
                     self_attn,
                 )
                 patched_layers += 1
 
         if patched_layers > 0:
             print(
-                f"[VLMModel] Applied custom paged KIVI-style KV cache "
+                f"[VLMModel] Applied TurboQuant KV cache "
                 f"to {patched_layers} layers "
-                f"(page size = 64, group size = 32, "
-                f"2-bit quantized KV, packed uint8 storage, page table, "
-                f"QUOKA-style prefill top-k attention by cosine similarity, "
-                f"custom decoder KV starts after 4 decode tokens)"
+                f"(key bits = 3, value bits = 3, "
+                f"keys use TurboQuantProd asymmetric attention, "
+                f"values use TurboQuantMSE reconstruction, "
+                f"contiguous quantized prefill cache with dense decode tail, "
+                f"per-layer runtime reset on generate)"
             )
         
         if 'kv_cache' not in self._optimizations_applied:
